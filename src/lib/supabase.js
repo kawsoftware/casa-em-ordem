@@ -1,11 +1,12 @@
 
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+// Fallback values prevent the entire app from crashing (White Screen) if Env Vars are missing
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://setup-env-vars.supabase.co';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'public-anon-key';
 
-if (!supabaseUrl || !supabaseAnonKey) {
-    console.warn('Supabase URL or Key missing in environment variables.');
+if (!import.meta.env.VITE_SUPABASE_URL || !import.meta.env.VITE_SUPABASE_ANON_KEY) {
+    console.warn('⚠️ CRITICAL: Supabase environment variables are missing! The app will not work correctly until you add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to Vercel Settings.');
 }
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
