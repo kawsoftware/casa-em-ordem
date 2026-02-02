@@ -3,9 +3,10 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import { Search, MapPin, CheckCircle, Clock, UserPlus, X, Loader2, AlertCircle } from 'lucide-react';
 import clsx from 'clsx';
+import { toast } from 'sonner';
 
 export default function Collaborators() {
-    const { profile } = useAuth(); // Logged-in admin
+    const { profile, user } = useAuth(); // Logged-in admin
     const [profiles, setProfiles] = useState([]);
     const [loading, setLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
@@ -42,15 +43,76 @@ export default function Collaborators() {
 
     const handleCreateDriver = async (e) => {
         e.preventDefault();
+
+        // --- JIT Organization Fix ---
         if (!profile?.organization_id) {
-            alert("Erro: Organização não identificada no seu perfil.");
+            // Use a custom toast with action button instead of browser confirm
+            toast('Perfil sem organização vinculada', {
+                description: "Deseja criar uma 'Minha Empresa' agora?",
+                action: {
+                    label: 'Criar Agora',
+                    onClick: async () => {
+                        setSubmitLoading(true);
+                        try {
+                            // 1. Create Org
+                            let createdOrg = null;
+
+                            const { data: newOrg, error: orgError } = await supabase
+                                .from('organizations')
+                                .insert({ name: 'Minha Empresa', created_at: new Date() })
+                                .select()
+                                .single();
+
+                            if (orgError) {
+                                if (orgError.message?.includes('violates row-level security')) {
+                                    throw new Error("Permissão negada pelo banco de dados. Contate o suporte para liberar criação de empresas.");
+                                }
+                                throw orgError;
+                            }
+
+                            createdOrg = newOrg;
+
+                            // Security Fallback: If RLS blocked SELECT but allowed INSERT, fetch blindly?
+                            // Actually, if we can't see it, we can't get the ID.
+                            // But maybe we can fetch by name just created? Hard to guarantee uniqueness.
+
+                            if (!createdOrg) {
+                                throw new Error("Organização criada, mas não foi possível recuperar o ID (RLS de Select bloqueando?)");
+                            }
+
+                            // 2. Link to Profile (Use user.id (auth.uid()) which is stable, unlike profile object which might be loading)
+                            const { error: profileError } = await supabase
+                                .from('profiles')
+                                .update({ organization_id: createdOrg.id })
+                                .eq('id', user.id);
+
+                            if (profileError) throw profileError;
+
+                            toast.success("Organização criada! Atualizando...");
+
+                            // Reload gently
+                            setTimeout(() => window.location.reload(), 1500);
+
+                        } catch (err) {
+                            if (err.name !== 'AbortError') {
+                                console.error(err);
+                                toast.error(err.message || "Erro ao criar organização.");
+                            }
+                            setSubmitLoading(false);
+                        }
+                    }
+                },
+                duration: 8000, // Give user time to read
+            });
             return;
         }
+        // ---------------------------
+
         if (!newDriver.fullName || !newDriver.whatsapp) return;
 
         setSubmitLoading(true);
         try {
-            const newId = crypto.randomUUID(); // Generate ID manually for Ghost User
+            const newId = crypto.randomUUID();
 
             const { error } = await supabase.from('profiles').insert({
                 id: newId,
@@ -62,14 +124,14 @@ export default function Collaborators() {
 
             if (error) throw error;
 
-            // Success
+            toast.success("Colaborador criado com sucesso!");
             setNewDriver({ fullName: '', whatsapp: '' });
             setIsModalOpen(false);
             fetchProfiles();
 
         } catch (err) {
             console.error("Error creating driver:", err);
-            alert("Erro ao criar colaborador. Verifique se o WhatsApp já está cadastrado ou se você tem permissão.");
+            toast.error("Erro ao criar colaborador. Verifique se o WhatsApp já existe.");
         } finally {
             setSubmitLoading(false);
         }

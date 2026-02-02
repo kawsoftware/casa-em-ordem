@@ -7,6 +7,7 @@ import Login from './pages/Login';
 import SignUp from './pages/SignUp';
 import ServiceManager from './pages/ServiceManager';
 import Collaborators from './pages/Collaborators';
+import { Toaster } from 'sonner';
 
 const ProtectedRoute = () => {
   const { user, loading } = useAuth();
@@ -43,6 +44,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Router>
+      <Toaster richColors position="top-right" />
     </AuthProvider>
   );
 }

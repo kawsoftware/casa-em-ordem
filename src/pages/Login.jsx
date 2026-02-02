@@ -27,7 +27,8 @@ export default function Login() {
             }
             setLoading(false);
         } else {
-            navigate('/dashboard');
+            // Navigation is handled by PublicRoute detecting user state change
+            // navigate('/dashboard'); 
         }
     };
 

@@ -91,22 +91,33 @@ export const AuthProvider = ({ children }) => {
         const init = async () => {
             try {
                 console.log("Auth: Initializing...");
+                // Supabase getSession sometimes aborts on rapid reloads. We can ignore aborts if we rely on onAuthStateChange.
                 const { data: { session }, error } = await supabase.auth.getSession();
 
-                if (error) throw error;
+                if (error) {
+                    // Ignore abort errors which are common in Vite HMR / React Strict Mode
+                    if (error.message && error.message.includes('aborted')) return;
+                    throw error;
+                }
 
                 if (mounted) {
                     setSession(session);
                     setUser(session?.user ?? null);
 
                     if (session?.user) {
-                        // Run logic to fetch or create profile
-                        const p = await ensureProfileExists(session.user);
-                        if (mounted) setProfile(p);
+                        // Non-blocking profile check for faster UI load
+                        ensureProfileExists(session.user).then(p => {
+                            if (mounted) setProfile(p);
+                        });
                     }
                 }
             } catch (e) {
-                console.error("Auth Init Validation Error:", e);
+                // Suppress loud abort errors in console
+                if (e.name === 'AbortError' || e.message?.includes('aborted')) {
+                    // Silent return
+                } else {
+                    console.error("Auth Init Validation Error:", e);
+                }
             } finally {
                 console.log("Auth: Done loading.");
                 if (mounted) setLoading(false);
@@ -124,10 +135,10 @@ export const AuthProvider = ({ children }) => {
             setUser(session?.user ?? null);
 
             if (session?.user) {
-                // Avoid re-running heavy healing on every refresh token, but basic fetch is needed
-                // For safety, just fetch.
-                const p = await fetchProfile(session.user.id);
-                if (mounted) setProfile(p);
+                // Non-blocking fetch
+                fetchProfile(session.user.id).then(p => {
+                    if (mounted) setProfile(p);
+                });
             } else {
                 if (mounted) setProfile(null);
             }

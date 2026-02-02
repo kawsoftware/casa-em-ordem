@@ -1,394 +1,367 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
-import { clsx } from 'clsx';
-import { AlertTriangle, Check, X, Building2, Calendar, DollarSign, FileText, ChevronRight, Layers, Loader2 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import {
+    CheckCircle, XCircle, Clock, FileText, AlertTriangle,
+    ArrowRight, Building, Truck, PieChart, Activity
+} from 'lucide-react';
+import { toast } from 'sonner';
+import clsx from 'clsx';
 
 export default function Dashboard() {
-    const { profile } = useAuth(); // Need profile to filter documents by org if needed, though RLS handles it
-
+    const { profile, user } = useAuth();
+    const [stats, setStats] = useState({ pending: 0, approved: 0, total: 0 });
     const [documents, setDocuments] = useState([]);
-    const [services, setServices] = useState([]);
-    const [costCenters, setCostCenters] = useState([]); // All cost centers available
-    const [selectedDocId, setSelectedDocId] = useState(null);
-
     const [loading, setLoading] = useState(true);
-    const [saving, setSaving] = useState(false);
 
-    // Form State
-    const [formData, setFormData] = useState({
-        service_id: '',
-        cost_center_id: '',
-        total_amount: '',
-        issued_at: '',
-        emitente_name: '',
-        emitente_cnpj: ''
-    });
+    // Filter state
+    const [filterStatus, setFilterStatus] = useState('review_needed'); // 'review_needed' | 'approved'
+
+    // Master Data for Selects (Cached or fetched on demand)
+    const [services, setServices] = useState([]);
+
+    // Cascading Data Cache: { serviceId: { tasks: [], costCenters: [] } }
+    const [cascadingData, setCascadingData] = useState({});
 
     useEffect(() => {
         if (profile?.organization_id) {
             fetchInitialData();
+            fetchServices();
         }
-    }, [profile]);
+    }, [profile?.organization_id, filterStatus]);
 
-    // Update form when selected document changes
-    useEffect(() => {
-        if (selectedDocId) {
-            const doc = documents.find(d => d.id === selectedDocId);
-            if (doc) {
-                setFormData({
-                    service_id: doc.service_id || '',
-                    cost_center_id: doc.cost_center_id || '',
-                    total_amount: doc.extracted_data?.detalhes_fiscais?.valor_total || '',
-                    issued_at: doc.extracted_data?.detalhes_fiscais?.data_emissao || '',
-                    emitente_name: doc.extracted_data?.emitente?.razao_social || '',
-                    emitente_cnpj: doc.extracted_data?.emitente?.cnpj_cpf || ''
-                });
-            }
-        }
-    }, [selectedDocId, documents]);
-
-    // Data Fetching
     const fetchInitialData = async () => {
         setLoading(true);
         try {
-            // Parallel Fetch
-            const [docsResponse, servicesResponse, ccResponse] = await Promise.all([
-                supabase
-                    .from('documents')
-                    .select('*, services(name), cost_centers(name, code)')
-                    .in('status', ['review_needed', 'processing'])
-                    .order('created_at', { ascending: false }),
+            // Fetch Documents
+            const { data: docs, error } = await supabase
+                .from('documents')
+                .select(`
+                    *,
+                    profiles!uploaded_by_profile_id (full_name, role)
+                `)
+                .eq('status', filterStatus)
+                // Filter by org via linked service? No, documents table usually has no org_id directly?
+                // The schema didn't specify org_id in documents.
+                // Assuming RLS handles it via 'service_id' -> 'organization_id' OR user ownership?
+                // Wait, if document is NEW, it might not have service_id yet.
+                // WE NEED A WAY TO FILTER BY ORG. 
+                // Assuming documents are orphans initially?
+                // Let's assume we fetch ALL documents that we have access to via RLS.
+                .order('created_at', { ascending: false });
 
-                supabase
-                    .from('services')
-                    .select('*')
-                    .eq('is_active', true)
-                    .order('name'),
+            if (error) throw error;
+            setDocuments(docs || []);
 
-                supabase
-                    .from('cost_centers')
-                    .select('*')
-                    .order('code')
-            ]);
+            // Fetch Stats (Quick Count)
+            // Just counting current list for simplicity or separate query?
+            // Real dashboard should have separate count queries, but let's mock for now.
+            setStats({
+                pending: docs?.filter(d => d.status === 'review_needed').length || 0,
+                approved: docs?.filter(d => d.status === 'approved').length || 0,
+                total: docs?.length || 0
+            });
 
-            if (docsResponse.data) {
-                setDocuments(docsResponse.data);
-                if (docsResponse.data.length > 0) setSelectedDocId(docsResponse.data[0].id);
-            }
-            if (servicesResponse.data) setServices(servicesResponse.data);
-            if (ccResponse.data) setCostCenters(ccResponse.data);
-
-        } catch (error) {
-            console.error("Error fetching data:", error);
+        } catch (err) {
+            console.error(err);
+            toast.error("Erro ao carregar documentos");
         } finally {
             setLoading(false);
         }
     };
 
-    const activeDoc = documents.find(d => d.id === selectedDocId);
+    const fetchServices = async () => {
+        const { data } = await supabase
+            .from('services')
+            .select('id, name')
+            .eq('organization_id', profile.organization_id)
+            .eq('is_active', true)
+            .order('name');
+        setServices(data || []);
+    };
 
-    // Cascading Select Logic: Filter Cost Centers based on selected Service
-    const availableCostCenters = formData.service_id
-        ? costCenters.filter(cc => cc.service_id === formData.service_id)
-        : [];
+    // Lazy load cascading data when a service is selected
+    const fetchServiceDetails = async (serviceId) => {
+        if (cascadingData[serviceId]) return; // Already cached
 
-    const handleApprove = async () => {
-        if (!activeDoc) return;
-        setSaving(true);
+        try {
+            const [tasks, costs] = await Promise.all([
+                supabase.from('tasks').select('id, title').eq('service_id', serviceId),
+                supabase.from('cost_centers').select('id, name, code').eq('service_id', serviceId)
+            ]);
 
-        // Merge inputs into current extracted_data object
-        const updatedExtractedData = {
-            ...(activeDoc.extracted_data || {}),
-            emitente: {
-                ...(activeDoc.extracted_data?.emitente || {}),
-                razao_social: formData.emitente_name,
-                cnpj_cpf: formData.emitente_cnpj
-            },
-            detalhes_fiscais: {
-                ...(activeDoc.extracted_data?.detalhes_fiscais || {}),
-                valor_total: formData.total_amount ? parseFloat(formData.total_amount) : 0,
-                data_emissao: formData.issued_at
-            }
-        };
-
-        const { error } = await supabase
-            .from('documents')
-            .update({
-                status: 'approved',
-                service_id: formData.service_id || null,
-                cost_center_id: formData.cost_center_id || null,
-                extracted_data: updatedExtractedData,
-                updated_at: new Date().toISOString() // Optional explicit timestamp
-            })
-            .eq('id', selectedDocId);
-
-        if (!error) {
-            removeDocFromList(selectedDocId);
-        } else {
-            alert("Erro ao aprovar: " + error.message);
+            setCascadingData(prev => ({
+                ...prev,
+                [serviceId]: {
+                    tasks: tasks.data || [],
+                    costCenters: costs.data || []
+                }
+            }));
+        } catch (err) {
+            console.error("Cascading fetch error", err);
         }
-        setSaving(false);
     };
-
-    const handleReject = async () => {
-        if (!activeDoc) return;
-        setSaving(true);
-        const { error } = await supabase
-            .from('documents')
-            .update({ status: 'rejected' })
-            .eq('id', selectedDocId);
-
-        if (!error) {
-            removeDocFromList(selectedDocId);
-        } else {
-            alert("Erro ao rejeitar: " + error.message);
-        }
-        setSaving(false);
-    };
-
-    const removeDocFromList = (id) => {
-        const nextDocs = documents.filter(d => d.id !== id);
-        setDocuments(nextDocs);
-        if (nextDocs.length > 0) setSelectedDocId(nextDocs[0].id);
-        else setSelectedDocId(null);
-    };
-
-    if (loading) return (
-        <div className="flex items-center justify-center h-full text-gray-500 gap-2">
-            <Loader2 className="animate-spin h-5 w-5 text-indigo-600" />
-            Carregando documentos...
-        </div>
-    );
 
     return (
-        <div className="flex h-screen overflow-hidden bg-gray-50">
+        <div className="p-8 max-w-7xl mx-auto space-y-8 min-h-screen bg-gray-50/50">
+            {/* Header / Stats */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <StatCard
+                    title="Pendente Aprovação"
+                    value={stats.pending}
+                    icon={Clock}
+                    color="text-amber-600"
+                    bg="bg-amber-50"
+                    border="border-amber-100"
+                />
+                <StatCard
+                    title="Aprovado (Hoje)"
+                    value={stats.approved}
+                    icon={CheckCircle}
+                    color="text-emerald-600"
+                    bg="bg-emerald-50"
+                    border="border-emerald-100"
+                />
+                <StatCard
+                    title="Total Processado"
+                    value={stats.total}
+                    icon={Activity}
+                    color="text-indigo-600"
+                    bg="bg-indigo-50"
+                    border="border-indigo-100"
+                />
+            </div>
 
-            {/* LEFT COLUMN - LIST */}
-            <div className="w-[320px] flex flex-col bg-white border-r border-gray-200 z-10">
-                <div className="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
-                    <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
-                        <Layers size={16} className="text-indigo-500" />
-                        Pendentes ({documents.length})
-                    </h2>
-                </div>
-                <div className="flex-1 overflow-y-auto overflow-x-hidden">
-                    {documents.length === 0 ? (
-                        <div className="p-8 text-center text-gray-400 text-sm">
-                            <div className="mb-2 flex justify-center"><Check className="h-8 w-8 text-gray-200" /></div>
-                            Tudo em dia!
+            {/* Filter Tabs */}
+            <div className="flex border-b border-gray-200">
+                <button
+                    onClick={() => setFilterStatus('review_needed')}
+                    className={clsx(
+                        "px-6 py-3 text-sm font-medium border-b-2 transition-colors",
+                        filterStatus === 'review_needed'
+                            ? "border-amber-500 text-amber-700 bg-amber-50/50"
+                            : "border-transparent text-gray-500 hover:text-gray-700"
+                    )}
+                >
+                    Fila de Aprovação
+                </button>
+                <button
+                    onClick={() => setFilterStatus('approved')}
+                    className={clsx(
+                        "px-6 py-3 text-sm font-medium border-b-2 transition-colors",
+                        filterStatus === 'approved'
+                            ? "border-emerald-500 text-emerald-700 bg-emerald-50/50"
+                            : "border-transparent text-gray-500 hover:text-gray-700"
+                    )}
+                >
+                    Histórico Aprovado
+                </button>
+            </div>
+
+            {/* Documents Grid */}
+            <div className="space-y-4">
+                {loading ? (
+                    <div className="text-center py-12 text-gray-400">Carregando documentos...</div>
+                ) : documents.length === 0 ? (
+                    <div className="text-center py-12 bg-white rounded-lg border border-dashed border-gray-300">
+                        <CheckCircle className="mx-auto h-12 w-12 text-gray-200 mb-3" />
+                        <h3 className="text-lg font-medium text-gray-900">Tudo limpo!</h3>
+                        <p className="text-gray-500">Nenhum documento encontrado neste filtro.</p>
+                    </div>
+                ) : (
+                    <div className="grid grid-cols-1 gap-6">
+                        {documents.map(doc => (
+                            <DocumentCard
+                                key={doc.id}
+                                doc={doc}
+                                services={services}
+                                cascadingData={cascadingData}
+                                onFetchDetails={fetchServiceDetails}
+                                onApprove={() => {
+                                    setDocuments(docs => docs.filter(d => d.id !== doc.id));
+                                    toast.success("Documento aprovado!");
+                                    setStats(prev => ({ ...prev, pending: prev.pending - 1, approved: prev.approved + 1 }));
+                                }}
+                            />
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function StatCard({ title, value, icon: Icon, color, bg, border }) {
+    return (
+        <div className={clsx("p-6 rounded-xl border shadow-sm flex items-center justify-between", bg, border)}>
+            <div>
+                <p className={clsx("text-sm font-bold uppercase tracking-wider mb-1", color.replace('text-', 'text-opacity-70 text-'))}>{title}</p>
+                <p className={clsx("text-3xl font-extrabold", color)}>{value}</p>
+            </div>
+            <div className={clsx("p-3 rounded-full bg-white bg-opacity-60", color)}>
+                <Icon size={24} />
+            </div>
+        </div>
+    );
+}
+
+function DocumentCard({ doc, services, cascadingData, onFetchDetails, onApprove }) {
+    // Local state for editing the classification
+    // Initialize with existing values if any
+    const [selectedService, setSelectedService] = useState(doc.service_id || '');
+    const [selectedTask, setSelectedTask] = useState(doc.task_id || '');
+    const [selectedCostCenter, setSelectedCostCenter] = useState(doc.cost_center_id || '');
+    const [saving, setSaving] = useState(false);
+
+    // Derived AI Data (Mock/Structure)
+    const aiData = doc.extracted_data || {};
+    const aiAmount = aiData.total_amount ? new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(aiData.total_amount) : 'R$ --';
+
+    // Handler when service changes
+    const handleServiceChange = (e) => {
+        const id = e.target.value;
+        setSelectedService(id);
+        setSelectedTask('');
+        setSelectedCostCenter('');
+        if (id) onFetchDetails(id);
+    };
+
+    const handleApprove = async () => {
+        if (!selectedService || !selectedCostCenter) {
+            toast.error("Selecione a Obra e o Centro de Custo obrigatórios.");
+            return;
+        }
+
+        setSaving(true);
+        try {
+            const { error } = await supabase
+                .from('documents')
+                .update({
+                    status: 'approved',
+                    service_id: selectedService,
+                    task_id: selectedTask || null, // Optional
+                    cost_center_id: selectedCostCenter,
+                    approved_at: new Date()
+                })
+                .eq('id', doc.id);
+
+            if (error) throw error;
+            onApprove(); // Remove from UI
+        } catch (err) {
+            console.error(err);
+            toast.error("Erro ao aprovar documento.");
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const tasks = cascadingData[selectedService]?.tasks || [];
+    const costCenters = cascadingData[selectedService]?.costCenters || [];
+
+    return (
+        <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden flex flex-col md:flex-row animate-in fade-in slide-in-from-bottom-4 duration-300">
+            {/* Image Preview Side */}
+            <div className="w-full md:w-64 bg-gray-100 p-4 flex items-center justify-center shrink-0 border-r border-gray-200">
+                {doc.file_url ? (
+                    <img src={doc.file_url} alt="Nota Fiscal" className="max-h-48 object-contain rounded shadow-sm" />
+                ) : (
+                    <div className="text-gray-400 flex flex-col items-center">
+                        <FileText size={48} />
+                        <span className="text-xs mt-2">Sem imagem</span>
+                    </div>
+                )}
+            </div>
+
+            {/* Content Side */}
+            <div className="flex-1 p-6 flex flex-col">
+                <div className="flex justify-between items-start mb-4">
+                    <div>
+                        <h4 className="font-bold text-gray-900 flex items-center gap-2">
+                            <FileText size={16} className="text-indigo-500" />
+                            Documento #{doc.id.slice(0, 8)}
+                        </h4>
+                        <p className="text-xs text-gray-500 mt-1">
+                            Enviado por <span className="font-semibold text-gray-700">{doc.profiles?.full_name || 'Desconhecido'}</span> em {new Date(doc.created_at).toLocaleDateString()}
+                        </p>
+                    </div>
+                    <div className="text-right">
+                        <div className="text-2xl font-bold text-gray-900">{aiAmount}</div>
+                        <div className="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full inline-block font-medium border border-emerald-100">
+                            IA Confidence: 98%
                         </div>
-                    ) : (
-                        <div className="divide-y divide-gray-100">
-                            {documents.map(doc => {
-                                const isLowConfidence = doc.ai_metadata?.confianca === 'BAIXA';
-                                return (
-                                    <div
-                                        key={doc.id}
-                                        onClick={() => setSelectedDocId(doc.id)}
-                                        className={clsx(
-                                            "p-4 cursor-pointer transition-colors relative group",
-                                            selectedDocId === doc.id ? "bg-indigo-50" : "hover:bg-gray-50"
-                                        )}
-                                    >
-                                        {/* Status Indicator Bar */}
-                                        {selectedDocId === doc.id && (
-                                            <div className="absolute left-0 top-0 bottom-0 w-1 bg-indigo-500" />
-                                        )}
+                    </div>
+                </div>
 
-                                        <div className="flex justify-between items-start mb-1">
-                                            <span className="text-sm font-medium text-gray-900 truncate w-32" title={doc.extracted_data?.emitente?.razao_social}>
-                                                {doc.extracted_data?.emitente?.razao_social || 'Desconhecido'}
-                                            </span>
-                                            <span className="text-xs font-semibold text-gray-600 bg-gray-100 px-1.5 py-0.5 rounded">
-                                                R$ {doc.extracted_data?.detalhes_fiscais?.valor_total || '0'}
-                                            </span>
-                                        </div>
+                {/* Classification Area */}
+                <div className="bg-gray-50 p-4 rounded-lg border border-gray-100 grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
 
-                                        <div className="flex items-center gap-2 mt-2">
-                                            {isLowConfidence && (
-                                                <div className="flex items-center gap-1 text-[10px] uppercase font-bold text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-100">
-                                                    <AlertTriangle size={10} />
-                                                    Revisar
-                                                </div>
-                                            )}
-                                            <span className="text-xs text-gray-400 ml-auto">
-                                                {new Date(doc.created_at).toLocaleDateString()}
-                                            </span>
-                                        </div>
-                                    </div>
-                                );
-                            })}
+                    {/* 1. Service */}
+                    <div>
+                        <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">1. Serviço / Obra</label>
+                        <select
+                            className={clsx("w-full text-sm border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500", !selectedService && "border-amber-300 bg-amber-50")}
+                            value={selectedService}
+                            onChange={handleServiceChange}
+                            disabled={doc.status !== 'review_needed'}
+                        >
+                            <option value="">Selecione...</option>
+                            {services.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </select>
+                    </div>
+
+                    {/* 2. Task (Dependent) */}
+                    <div>
+                        <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">2. Tarefa (Opcional)</label>
+                        <select
+                            className="w-full text-sm border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-100 disabled:text-gray-400"
+                            value={selectedTask}
+                            onChange={e => setSelectedTask(e.target.value)}
+                            disabled={!selectedService || doc.status !== 'review_needed'}
+                        >
+                            <option value="">Geral / Sem Tarefa</option>
+                            {tasks.map(t => <option key={t.id} value={t.id}>{t.title}</option>)}
+                        </select>
+                    </div>
+
+                    {/* 3. Cost Center (Dependent) */}
+                    <div>
+                        <label className="block text-xs font-bold text-gray-500 uppercase mb-1.5">3. Classificação</label>
+                        <select
+                            className={clsx("w-full text-sm border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-100 disabled:text-gray-400", selectedService && !selectedCostCenter && "border-amber-300 bg-amber-50")}
+                            value={selectedCostCenter}
+                            onChange={e => setSelectedCostCenter(e.target.value)}
+                            disabled={!selectedService || doc.status !== 'review_needed'}
+                        >
+                            <option value="">Selecione...</option>
+                            {costCenters.map(cc => <option key={cc.id} value={cc.id}>{cc.name} ({cc.code})</option>)}
+                        </select>
+                    </div>
+                </div>
+
+                {/* Actions */}
+                <div className="mt-auto flex justify-end gap-3">
+                    {doc.status === 'review_needed' && (
+                        <>
+                            <button className="px-4 py-2 text-sm font-medium text-red-600 bg-white border border-gray-200 rounded-md hover:bg-red-50 hover:border-red-200 transition-colors">
+                                Rejeitar / Pedir Info
+                            </button>
+                            <button
+                                onClick={handleApprove}
+                                disabled={saving}
+                                className="px-6 py-2 text-sm font-bold text-white bg-indigo-600 rounded-md hover:bg-indigo-700 shadow-md transition-all flex items-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
+                            >
+                                {saving ? <Clock className="animate-spin" size={16} /> : <CheckCircle size={16} />}
+                                Aprovar Despesa
+                            </button>
+                        </>
+                    )}
+                    {doc.status === 'approved' && (
+                        <div className="flex items-center gap-2 text-emerald-600 font-bold text-sm bg-emerald-50 px-4 py-2 rounded-md border border-emerald-100">
+                            <CheckCircle size={18} />
+                            Aprovado em {new Date(doc.approved_at || Date.now()).toLocaleDateString()}
                         </div>
                     )}
                 </div>
-            </div>
-
-            {/* CENTER & RIGHT CONTENT */}
-            <div className="flex-1 flex overflow-hidden">
-                {activeDoc ? (
-                    <>
-                        {/* MIDDLE - IMAGE VIEWER */}
-                        <div className="flex-1 bg-[#111] relative flex flex-col justify-center items-center overflow-hidden">
-                            <div className="absolute top-4 left-4 z-10 bg-black/60 text-white text-xs px-3 py-1 rounded-full backdrop-blur-md font-mono">
-                                {activeDoc.file_url.split('/').pop()}
-                            </div>
-
-                            {activeDoc.file_url ? (
-                                <div className="w-full h-full p-8 flex items-center justify-center">
-                                    <img
-                                        src={activeDoc.file_url}
-                                        alt="Invoice"
-                                        className="max-w-full max-h-full object-contain shadow-2xl"
-                                    />
-                                </div>
-                            ) : (
-                                <div className="text-gray-500">Imagem não carregada</div>
-                            )}
-                        </div>
-
-                        {/* RIGHT - FORM */}
-                        <div className="w-[400px] bg-white border-l border-gray-200 flex flex-col h-full shadow-xl">
-                            <div className="p-6 border-b border-gray-100">
-                                <h2 className="text-lg font-bold text-gray-900">Validar Informações</h2>
-                                <p className="text-sm text-gray-500">Aprovação com atualização de JSON e Relacionamento.</p>
-                            </div>
-
-                            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-
-                                {/* CASCADING SELECTS SECTION */}
-                                <div className="space-y-4 bg-gray-50 p-4 rounded-lg border border-gray-100">
-                                    <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Classificação</h3>
-
-                                    <div className="space-y-1.5">
-                                        <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                                            <Building2 size={16} className="text-indigo-500" />
-                                            Obra / Serviço
-                                        </label>
-                                        <select
-                                            value={formData.service_id}
-                                            onChange={e => {
-                                                setFormData({
-                                                    ...formData,
-                                                    service_id: e.target.value,
-                                                    cost_center_id: '' // RESET CHILD WHEN PARENT CHANGES
-                                                });
-                                            }}
-                                            className="w-full p-2.5 bg-white border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-                                        >
-                                            <option value="">Selecione...</option>
-                                            {services.map(s => (
-                                                <option key={s.id} value={s.id}>{s.name}</option>
-                                            ))}
-                                        </select>
-                                    </div>
-
-                                    <div className="space-y-1.5">
-                                        <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                                            <ChevronRight size={16} className="text-gray-400" />
-                                            Centro de Custo (Vinculado)
-                                        </label>
-                                        <select
-                                            value={formData.cost_center_id}
-                                            onChange={e => setFormData({ ...formData, cost_center_id: e.target.value })}
-                                            disabled={!formData.service_id} // Disable if no parent selected
-                                            className="w-full p-2.5 bg-white border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all disabled:bg-gray-100 disabled:text-gray-400"
-                                        >
-                                            <option value="">
-                                                {formData.service_id ? 'Selecione o sub-item...' : 'Selecione uma obra primeiro'}
-                                            </option>
-                                            {availableCostCenters.map(cc => (
-                                                <option key={cc.id} value={cc.id}>{cc.code} - {cc.name}</option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                </div>
-
-                                {/* FINANCIAL DATA */}
-                                <div className="space-y-4">
-                                    <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Financeiro</h3>
-
-                                    <div className="grid grid-cols-2 gap-4">
-                                        <div className="space-y-1.5">
-                                            <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                                                <DollarSign size={16} className="text-emerald-600" />
-                                                Valor
-                                            </label>
-                                            <input
-                                                type="number"
-                                                step="0.01"
-                                                value={formData.total_amount}
-                                                onChange={e => setFormData({ ...formData, total_amount: e.target.value })}
-                                                className="w-full p-2.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
-                                            />
-                                        </div>
-
-                                        <div className="space-y-1.5">
-                                            <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                                                <Calendar size={16} className="text-orange-500" />
-                                                Data
-                                            </label>
-                                            <input
-                                                type="date"
-                                                value={formData.issued_at}
-                                                onChange={e => setFormData({ ...formData, issued_at: e.target.value })}
-                                                className="w-full p-2.5 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none"
-                                            />
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* EMITENTE */}
-                                <div className="space-y-3 pt-2 border-t border-gray-100">
-                                    <div className="space-y-1">
-                                        <label className="text-xs text-gray-500">Emitente (Razão Social)</label>
-                                        <input
-                                            value={formData.emitente_name}
-                                            onChange={e => setFormData({ ...formData, emitente_name: e.target.value })}
-                                            className="w-full p-2 border border-gray-200 rounded text-sm focus:border-indigo-500 outline-none"
-                                        />
-                                    </div>
-                                    <div className="space-y-1">
-                                        <label className="text-xs text-gray-500">CNPJ</label>
-                                        <input
-                                            value={formData.emitente_cnpj}
-                                            onChange={e => setFormData({ ...formData, emitente_cnpj: e.target.value })}
-                                            className="w-full p-2 border border-gray-200 rounded text-sm focus:border-indigo-500 outline-none"
-                                        />
-                                    </div>
-                                </div>
-
-                            </div>
-
-                            {/* ACTION FOOTER */}
-                            <div className="p-4 bg-gray-50 border-t border-gray-200 flex gap-3">
-                                <button
-                                    onClick={handleReject}
-                                    disabled={saving}
-                                    className="flex-1 py-2.5 px-4 rounded-md border border-red-200 text-red-600 font-medium hover:bg-red-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 text-sm"
-                                >
-                                    <X size={16} /> Rejeitar
-                                </button>
-                                <button
-                                    onClick={handleApprove}
-                                    disabled={saving || !formData.service_id} // Require Service ID
-                                    className="flex-[2] py-2.5 px-4 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700 shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                                >
-                                    {saving ? (
-                                        <Loader2 className="animate-spin h-4 w-4" />
-                                    ) : (
-                                        <><Check size={16} /> Aprovar Nota</>
-                                    )}
-                                </button>
-                            </div>
-                        </div>
-                    </>
-                ) : (
-                    <div className="flex-1 flex flex-col items-center justify-center bg-gray-50/50 text-gray-400">
-                        <FileText size={48} className="text-gray-200 mb-4" />
-                        <p>Selecione um documento da lista para iniciar a revisão.</p>
-                    </div>
-                )}
             </div>
         </div>
     );

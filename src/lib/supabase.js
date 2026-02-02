@@ -13,5 +13,14 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     auth: {
         persistSession: true,
         autoRefreshToken: true,
+        detectSessionInUrl: true
+    },
+    // Prevent AbortError spam by disabling global abort controller integration completely
+    global: {
+        fetch: (url, options) => {
+            // Remove signal property entirely from options
+            const { signal, ...rest } = options || {};
+            return fetch(url, rest);
+        }
     }
 });
