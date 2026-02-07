@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
-import { Search, MapPin, CheckCircle, Clock, UserPlus, X, Loader2, AlertCircle } from 'lucide-react';
+import { Search, MapPin, CheckCircle, Clock, UserPlus, X, Loader2, AlertCircle, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
 import clsx from 'clsx';
 import { toast } from 'sonner';
 
@@ -25,25 +25,109 @@ export default function Collaborators() {
     const fetchProfiles = async () => {
         setLoading(true);
         try {
+            // Task 1: Fetch ALL profiles for this org, not just drivers
             const { data, error } = await supabase
                 .from('profiles')
-                .select('*,cost_centers(name, code)')
-                .eq('role', 'driver')
-                .eq('organization_id', profile.organization_id) // RLS usually handles this, but good to be explicit
+                .select('*')
+                .eq('organization_id', profile.organization_id)
                 .order('full_name');
 
             if (error) throw error;
             setProfiles(data || []);
         } catch (err) {
             console.error("Error fetching profiles:", err);
+            toast.error("Erro ao carregar usuários.");
         } finally {
             setLoading(false);
+        }
+    };
+
+    const handleUpdateRole = async (targetId, newRole) => {
+        if (!confirm(`Confirmar alteração de permissão para "${newRole}"?`)) return;
+        try {
+            const { error } = await supabase
+                .from('profiles')
+                .update({ role: newRole })
+                .eq('id', targetId);
+
+            if (error) throw error;
+            toast.success(`Usuário atualizado para ${newRole}`);
+            fetchProfiles();
+        } catch (err) {
+            console.error(err);
+            toast.error("Erro ao atualizar permissão.");
         }
     };
 
     const handleCreateDriver = async (e) => {
         e.preventDefault();
 
+        // --- Logic Branch: System Access Invite ---
+        if (newDriver.type === 'access') {
+            if (!newDriver.fullName || !newDriver.email) {
+                toast.error("Nome e E-mail são obrigatórios.");
+                return;
+            }
+
+            setSubmitLoading(true);
+            try {
+                // 1. Check Session explicitly (to handle the "Refresh token not found" issues)
+                const { data: { session } } = await supabase.auth.getSession();
+                if (!session) {
+                    toast.error("Sessão expirada. Por favor, faça login novamente.");
+                    window.location.reload();
+                    return;
+                }
+
+                // 2. Invoke Edge Function
+                const { data, error } = await supabase.functions.invoke('admin-invite', {
+                    body: {
+                        fullName: newDriver.fullName,
+                        email: newDriver.email,
+                        role: newDriver.accessRole || 'manager',
+                        organization_id: profile.organization_id
+                    }
+                });
+
+                // 3. Handle 4xx/5xx Errors from Edge Function
+                if (error) {
+                    let errorMessage = "Erro na comunicação com o servidor.";
+
+                    // Try to parse the error response body if it's a FunctionsHttpError
+                    if (error.context && typeof error.context.json === 'function') {
+                        try {
+                            const body = await error.context.json();
+                            errorMessage = body.details || body.error || error.message;
+                        } catch (e) {
+                            console.error("Failed to parse error body", e);
+                        }
+                    } else {
+                        errorMessage = error.message;
+                    }
+
+                    throw new Error(errorMessage);
+                }
+
+                // 4. Handle Logic Errors returned in 200 JSON
+                if (data?.error) {
+                    throw new Error(data.details?.message || data.error);
+                }
+
+                toast.success("Convite enviado com sucesso!");
+                setIsModalOpen(false);
+                setNewDriver({ fullName: '', whatsapp: '', email: '', type: 'no_access' });
+                fetchProfiles();
+
+            } catch (err) {
+                console.error("Detailed Invite Error:", err);
+                toast.error(err.message || "Erro ao processar convite.");
+            } finally {
+                setSubmitLoading(false);
+            }
+            return;
+        }
+
+        // --- Logic Branch: Simple Collaborator (Existing) ---
         // --- JIT Organization Fix ---
         if (!profile?.organization_id) {
             // Use a custom toast with action button instead of browser confirm
@@ -72,15 +156,11 @@ export default function Collaborators() {
 
                             createdOrg = newOrg;
 
-                            // Security Fallback: If RLS blocked SELECT but allowed INSERT, fetch blindly?
-                            // Actually, if we can't see it, we can't get the ID.
-                            // But maybe we can fetch by name just created? Hard to guarantee uniqueness.
-
                             if (!createdOrg) {
                                 throw new Error("Organização criada, mas não foi possível recuperar o ID (RLS de Select bloqueando?)");
                             }
 
-                            // 2. Link to Profile (Use user.id (auth.uid()) which is stable, unlike profile object which might be loading)
+                            // 2. Link to Profile
                             const { error: profileError } = await supabase
                                 .from('profiles')
                                 .update({ organization_id: createdOrg.id })
@@ -89,8 +169,6 @@ export default function Collaborators() {
                             if (profileError) throw profileError;
 
                             toast.success("Organização criada! Atualizando...");
-
-                            // Reload gently
                             setTimeout(() => window.location.reload(), 1500);
 
                         } catch (err) {
@@ -102,13 +180,13 @@ export default function Collaborators() {
                         }
                     }
                 },
-                duration: 8000, // Give user time to read
+                duration: 8000,
             });
             return;
         }
         // ---------------------------
 
-        if (!newDriver.fullName || !newDriver.whatsapp) return;
+        if (!newDriver.fullName) return;
 
         setSubmitLoading(true);
         try {
@@ -117,8 +195,8 @@ export default function Collaborators() {
             const { error } = await supabase.from('profiles').insert({
                 id: newId,
                 full_name: newDriver.fullName,
-                whatsapp_number: newDriver.whatsapp,
-                role: 'driver',
+                whatsapp_number: newDriver.whatsapp || null,
+                role: 'driver', // Default is driver/collaborator
                 organization_id: profile.organization_id
             });
 
@@ -142,19 +220,30 @@ export default function Collaborators() {
         p.whatsapp_number?.includes(searchTerm)
     );
 
+    const getRoleBadge = (role) => {
+        switch (role) {
+            case 'admin': return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-purple-100 text-purple-700 border border-purple-200"><ShieldCheck size={10} /> Admin</span>;
+            case 'manager': return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-blue-100 text-blue-700 border border-blue-200"><Shield size={10} /> Gerente</span>;
+            case 'driver': return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 border border-gray-200">Colaborador</span>;
+            default: return <span className="text-xs text-gray-400">{role}</span>;
+        }
+    };
+
+    const isAdmin = profile?.role === 'admin';
+
     return (
         <div className="p-8 max-w-6xl mx-auto space-y-6">
             <div className="flex justify-between items-center">
                 <div>
-                    <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Colaboradores</h1>
-                    <p className="text-gray-500 mt-1">Gestão da força de trabalho em campo.</p>
+                    <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Gestão de Usuários</h1>
+                    <p className="text-gray-500 mt-1">Gerencie permissões e colaboradores da organização.</p>
                 </div>
                 <button
                     onClick={() => setIsModalOpen(true)}
                     className="bg-indigo-600 text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-indigo-700 shadow-sm transition-all flex items-center gap-2"
                 >
                     <UserPlus size={18} />
-                    Novo Colaborador
+                    Novo Usuário
                 </button>
             </div>
 
@@ -177,31 +266,40 @@ export default function Collaborators() {
                         <thead>
                             <tr className="bg-gray-50 text-gray-500 font-medium border-b border-gray-200">
                                 <th className="px-6 py-3">Nome</th>
-                                <th className="px-6 py-3">WhatsApp</th>
-                                <th className="px-6 py-3">Status de Alocação</th>
-                                <th className="px-6 py-3">Organização</th>
+                                <th className="px-6 py-3">Contato</th>
+                                <th className="px-6 py-3">Função (Role)</th>
+                                <th className="px-6 py-3">Alocação</th>
+                                {isAdmin && <th className="px-6 py-3 text-right">Ações</th>}
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100">
                             {loading ? (
-                                <tr><td colSpan="4" className="p-8 text-center text-gray-400">Carregando colaboradores...</td></tr>
+                                <tr><td colSpan="5" className="p-8 text-center text-gray-400">Carregando...</td></tr>
                             ) : filteredProfiles.length === 0 ? (
-                                <tr><td colSpan="4" className="p-8 text-center text-gray-400">Nenhum colaborador encontrado.</td></tr>
+                                <tr><td colSpan="5" className="p-8 text-center text-gray-400">Nenhum usuário encontrado.</td></tr>
                             ) : (
                                 filteredProfiles.map(p => {
                                     const isAllocated = !!p.current_cost_center_id;
+                                    const isMe = p.id === user?.id; // Don't demote yourself perfectly
+
                                     return (
                                         <tr key={p.id} className="hover:bg-gray-50/50 transition-colors">
                                             <td className="px-6 py-4 font-medium text-gray-900">
                                                 <div className="flex items-center gap-3">
                                                     <div className="h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-xs border border-indigo-200">
-                                                        {p.full_name?.charAt(0)}
+                                                        {p.full_name?.charAt(0).toUpperCase()}
                                                     </div>
-                                                    {p.full_name}
+                                                    <div>
+                                                        <div className="font-semibold">{p.full_name}</div>
+                                                        <div className="text-[10px] text-gray-400 font-mono">ID: {p.id.slice(0, 6)}...</div>
+                                                    </div>
                                                 </div>
                                             </td>
                                             <td className="px-6 py-4 text-gray-500 font-mono text-xs">
                                                 {p.whatsapp_number || '-'}
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                {getRoleBadge(p.role)}
                                             </td>
                                             <td className="px-6 py-4">
                                                 {isAllocated ? (
@@ -210,15 +308,36 @@ export default function Collaborators() {
                                                         {p.cost_centers?.code || 'Alocado'}
                                                     </span>
                                                 ) : (
-                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 border border-gray-200">
+                                                    <span className="inline-flex items-center gap-1 text-gray-400 text-xs">
                                                         <Clock size={12} />
-                                                        Disponível
+                                                        Livre
                                                     </span>
                                                 )}
                                             </td>
-                                            <td className="px-6 py-4 text-gray-400 text-xs">
-                                                ID: {p.organization_id?.slice(0, 8)}...
-                                            </td>
+                                            {isAdmin && (
+                                                <td className="px-6 py-4 text-right">
+                                                    {!isMe && (
+                                                        <div className="flex justify-end gap-2">
+                                                            {p.role !== 'manager' && p.role !== 'admin' && (
+                                                                <button
+                                                                    onClick={() => handleUpdateRole(p.id, 'manager')}
+                                                                    className="text-xs font-medium text-blue-600 hover:text-blue-800 bg-blue-50 px-2 py-1 rounded border border-blue-100 hover:border-blue-200 transition-colors"
+                                                                >
+                                                                    Promover a Gerente
+                                                                </button>
+                                                            )}
+                                                            {p.role === 'manager' && (
+                                                                <button
+                                                                    onClick={() => handleUpdateRole(p.id, 'driver')}
+                                                                    className="text-xs font-medium text-amber-600 hover:text-amber-800 bg-amber-50 px-2 py-1 rounded border border-amber-100 hover:border-amber-200 transition-colors"
+                                                                >
+                                                                    Rebaixar
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </td>
+                                            )}
                                         </tr>
                                     );
                                 })
@@ -233,55 +352,117 @@ export default function Collaborators() {
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
                     <div className="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
                         <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50">
-                            <h3 className="font-bold text-gray-900">Novo Colaborador</h3>
+                            <h3 className="font-bold text-gray-900">Novo Usuário / Colaborador</h3>
                             <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
                         </div>
 
-                        <form onSubmit={handleCreateDriver} className="p-6 space-y-4">
-                            <div className="bg-blue-50 border border-blue-100 rounded-md p-3 text-xs text-blue-700 flex gap-2">
-                                <AlertCircle size={16} className="shrink-0" />
-                                Este usuário não terá acesso ao sistema. Ele será usado apenas para vinculação de despesas.
-                            </div>
-
-                            <div className="space-y-1">
-                                <label className="text-sm font-medium text-gray-700">Nome Completo</label>
-                                <input
-                                    required
-                                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-                                    placeholder="Ex: João da Silva"
-                                    value={newDriver.fullName}
-                                    onChange={e => setNewDriver({ ...newDriver, fullName: e.target.value })}
-                                />
-                            </div>
-
-                            <div className="space-y-1">
-                                <label className="text-sm font-medium text-gray-700">WhatsApp (com DDD)</label>
-                                <input
-                                    required
-                                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-                                    placeholder="Ex: 5511999998888"
-                                    value={newDriver.whatsapp}
-                                    onChange={e => setNewDriver({ ...newDriver, whatsapp: e.target.value })}
-                                />
-                            </div>
-
-                            <div className="pt-4 flex gap-3">
+                        <div className="p-6">
+                            {/* Tabs for User Type */}
+                            <div className="flex p-1 bg-gray-100 rounded-lg mb-6">
                                 <button
-                                    type="button"
-                                    onClick={() => setIsModalOpen(false)}
-                                    className="flex-1 px-4 py-2 border border-gray-300 rounded-md text-gray-700 font-medium hover:bg-gray-50 text-sm"
+                                    onClick={() => setNewDriver(prev => ({ ...prev, type: 'no_access' }))}
+                                    className={clsx(
+                                        "flex-1 py-2 text-xs font-bold rounded-md transition-all",
+                                        newDriver.type !== 'access' ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                                    )}
                                 >
-                                    Cancelar
+                                    Apenas Colaborador
                                 </button>
                                 <button
-                                    type="submit"
-                                    disabled={submitLoading}
-                                    className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-md font-medium hover:bg-indigo-700 text-sm flex justify-center items-center disabled:opacity-70"
+                                    onClick={() => setNewDriver(prev => ({ ...prev, type: 'access' }))}
+                                    className={clsx(
+                                        "flex-1 py-2 text-xs font-bold rounded-md transition-all",
+                                        newDriver.type === 'access' ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                                    )}
                                 >
-                                    {submitLoading ? <Loader2 className="animate-spin h-4 w-4" /> : 'Criar Cadatro'}
+                                    Acesso ao Sistema
                                 </button>
                             </div>
-                        </form>
+
+                            <form onSubmit={handleCreateDriver} className="space-y-4">
+                                {newDriver.type === 'access' ? (
+                                    <div className="bg-purple-50 border border-purple-100 rounded-md p-3 text-xs text-purple-700 flex gap-2">
+                                        <ShieldCheck size={16} className="shrink-0" />
+                                        <div>
+                                            Este usuário receberá um <strong>e-mail de convite</strong> para criar sua senha. Ele poderá acessar o painel conforme o nível escolhido.
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="bg-blue-50 border border-blue-100 rounded-md p-3 text-xs text-blue-700 flex gap-2">
+                                        <AlertCircle size={16} className="shrink-0" />
+                                        <div>
+                                            Este usuário <strong>NÃO</strong> terá acesso ao sistema. Ele será usado apenas para cadastro em obras/serviços.
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="space-y-1">
+                                    <label className="text-sm font-medium text-gray-700">Nome Completo</label>
+                                    <input
+                                        required
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                                        placeholder="Ex: João da Silva"
+                                        value={newDriver.fullName}
+                                        onChange={e => setNewDriver({ ...newDriver, fullName: e.target.value })}
+                                    />
+                                </div>
+
+                                {newDriver.type === 'access' ? (
+                                    <>
+                                        <div className="space-y-1">
+                                            <label className="text-sm font-medium text-gray-700">E-mail Corporativo</label>
+                                            <input
+                                                required
+                                                type="email"
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                                                placeholder="nome@empresa.com"
+                                                value={newDriver.email || ''}
+                                                onChange={e => setNewDriver({ ...newDriver, email: e.target.value })}
+                                            />
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="text-sm font-medium text-gray-700">Nível de Acesso</label>
+                                            <select
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none bg-white"
+                                                value={newDriver.accessRole || 'manager'}
+                                                onChange={e => setNewDriver({ ...newDriver, accessRole: e.target.value })}
+                                            >
+                                                <option value="manager">Gerente (Acesso a seus serviços)</option>
+                                                <option value="admin">Administrador (Acesso Total)</option>
+                                            </select>
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="space-y-1">
+                                        <label className="text-sm font-medium text-gray-700">WhatsApp (com DDD)</label>
+                                        <input
+                                            required
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+                                            placeholder="Ex: 5511999998888"
+                                            value={newDriver.whatsapp}
+                                            onChange={e => setNewDriver({ ...newDriver, whatsapp: e.target.value })}
+                                        />
+                                    </div>
+                                )}
+
+                                <div className="pt-4 flex gap-3">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsModalOpen(false)}
+                                        className="flex-1 px-4 py-2 border border-gray-300 rounded-md text-gray-700 font-medium hover:bg-gray-50 text-sm"
+                                    >
+                                        Cancelar
+                                    </button>
+                                    <button
+                                        type="submit"
+                                        disabled={submitLoading}
+                                        className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-md font-medium hover:bg-indigo-700 text-sm flex justify-center items-center disabled:opacity-70"
+                                    >
+                                        {submitLoading ? <Loader2 className="animate-spin h-4 w-4" /> : (newDriver.type === 'access' ? 'Enviar Convite' : 'Criar Cadastro')}
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
                     </div>
                 </div>
             )}

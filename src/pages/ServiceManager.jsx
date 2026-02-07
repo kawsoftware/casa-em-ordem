@@ -2,20 +2,21 @@ import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 import {
-    Briefcase, Plus, Search, Layers, DollarSign, Users,
+    Briefcase, Plus, Search, Layers, DollarSign, Users, Send, UserPlus,
     ArrowRight, Trash2, CheckCircle, XCircle, AlertCircle, ChevronsRight, Truck
 } from 'lucide-react';
 import { toast } from 'sonner';
 import clsx from 'clsx';
+import StatusBadge from '../components/StatusBadge';
 
 export default function ServiceManager() {
-    const { profile } = useAuth();
+    const { user, profile } = useAuth();
     const [services, setServices] = useState([]);
     const [selectedService, setSelectedService] = useState(null);
     const [loading, setLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
 
-    // Tabs: 'tasks' | 'costs' | 'team'
+    // Tabs: 'tasks' | 'expenses' | 'team'
     const [activeTab, setActiveTab] = useState('tasks');
 
     useEffect(() => {
@@ -36,11 +37,7 @@ export default function ServiceManager() {
             if (error) throw error;
             setServices(data || []);
 
-            // Auto-select first if none selected
             if (data?.length > 0 && !selectedService) {
-                // Fetch full details for the first one isn't needed yet, just select the object
-                // But we will select it in the UI, which triggers data fetching via useEffect below?
-                // Better: Just let user select or select first ID
                 // setSelectedService(data[0]); 
             }
         } catch (err) {
@@ -52,13 +49,24 @@ export default function ServiceManager() {
     };
 
     const handleCreateService = async () => {
+        if (!user || !profile?.organization_id) {
+            toast.error("Erro de autenticação ou perfil incompleto.");
+            return;
+        }
+
         const name = prompt("Nome do novo Serviço / Obra:");
         if (!name) return;
 
         try {
+            console.log(`[ServiceManager] Criando serviço para owner/manager: ${user.id}`);
             const { data, error } = await supabase
                 .from('services')
-                .insert({ organization_id: profile.organization_id, name, is_active: true })
+                .insert({
+                    organization_id: profile.organization_id,
+                    name,
+                    is_active: true,
+                    manager_id: user.id // Injeção obrigatória do ID do criador como gestor inicial
+                })
                 .select()
                 .single();
 
@@ -67,7 +75,8 @@ export default function ServiceManager() {
             setSelectedService(data);
             toast.success("Serviço criado com sucesso!");
         } catch (err) {
-            toast.error("Erro ao criar serviço");
+            console.error("Erro ao criar serviço:", err);
+            toast.error("Erro ao criar serviço: " + (err.message || "Tente novamente"));
         }
     };
 
@@ -164,7 +173,7 @@ export default function ServiceManager() {
                     <div className="flex-1 flex flex-col items-center justify-center text-gray-400 p-8">
                         <Briefcase size={48} className="mb-4 text-gray-200" />
                         <p className="text-lg font-medium text-gray-500">Selecione um Serviço</p>
-                        <p className="text-sm">Gerencie tarefas, centros de custo e equipe alocada.</p>
+                        <p className="text-sm">Gerencie tarefas, tipos de despesa e equipe alocada.</p>
                     </div>
                 )}
             </div>
@@ -174,19 +183,24 @@ export default function ServiceManager() {
 
 // Sub-component for Details to properly handle its own fetching state based on Service ID change
 function ServiceDetailView({ service, activeTab, setActiveTab }) {
-    const { profile } = useAuth(); // Added missing hook
-    const [details, setDetails] = useState({ tasks: [], costCenters: [], team: [] });
+    const { profile } = useAuth();
+    const [details, setDetails] = useState({ tasks: [], expenseTypes: [], team: [] });
+    const [allExpenseTypes, setAllExpenseTypes] = useState([]); // Global list
     const [loading, setLoading] = useState(false);
 
     // Inputs
     const [newTaskTitle, setNewTaskTitle] = useState('');
-    const [newCostName, setNewCostName] = useState('');
-    const [newCostCode, setNewCostCode] = useState('');
 
     // Allocation Logic
     const [availableDrivers, setAvailableDrivers] = useState([]);
     const [driverToAlloc, setDriverToAlloc] = useState('');
-    const [targetCostCenter, setTargetCostCenter] = useState('');
+    const [scheduledAt, setScheduledAt] = useState('');
+
+    // Quick Add Logic
+    const [showQuickAdd, setShowQuickAdd] = useState(false);
+    const [quickName, setQuickName] = useState('');
+    const [quickPhone, setQuickPhone] = useState('');
+    const [isSavingQuick, setIsSavingQuick] = useState(false);
 
     useEffect(() => {
         fetchDetails();
@@ -200,35 +214,29 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
         setLoading(true);
         try {
             // Parallel fetch
-            const [tasksReq, costsReq, teamReq] = await Promise.all([
+            const [tasksReq, typesReq, serviceTypesReq, teamReq] = await Promise.all([
                 supabase.from('tasks').select('*').eq('service_id', service.id).order('title'),
-                supabase.from('cost_centers').select('*').eq('service_id', service.id).order('code'),
-                supabase.from('profiles')
-                    .select('*, cost_centers!inner(*)') // Inner join to filter only those linked to THIS service's CostCenters
-                    .eq('role', 'driver')
+                supabase.from('expense_types').select('*').order('name'), // Global types
+                supabase.from('service_expense_types').select('expense_type_id').eq('service_id', service.id), // Linked types
+                supabase.from('profile_services')
+                    .select('status, profile:profiles(*)')
+                    .eq('service_id', service.id)
             ]);
 
-            // For Team, we need to filter profiles whose cost_center belongs to this service.
-            // But strict filtering in Supabase via foreign table filters can be tricky.
-            // Let's do a client side filter to be safe if `!inner` misbehaves or RLS is weird.
-            // Wait, the easier way: Get all profiles where current_cost_center_id IN (list of coscenters IDs for this service).
+            // Flatten team data from relation
+            const teamData = (teamReq.data || []).map(item => ({
+                ...item.profile,
+                invite_status: item.status
+            })).filter(Boolean);
 
-            // Let's refetch Team properly after getting CostCenters
-            const costCenterIds = (costsReq.data || []).map(cc => cc.id);
-            let teamData = [];
+            setAllExpenseTypes(typesReq.data || []);
 
-            if (costCenterIds.length > 0) {
-                const { data } = await supabase
-                    .from('profiles')
-                    .select('*, cost_centers(name, code)')
-                    .in('current_cost_center_id', costCenterIds)
-                    .order('full_name');
-                teamData = data || [];
-            }
+            // Map linked types to IDs for easy lookup
+            const linkedTypeIds = (serviceTypesReq.data || []).map(t => t.expense_type_id);
 
             setDetails({
                 tasks: tasksReq.data || [],
-                costCenters: costsReq.data || [],
+                expenseTypes: linkedTypeIds, // Store IDs of enabled types
                 team: teamData
             });
 
@@ -241,9 +249,7 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
     };
 
     const fetchAvailableDrivers = async () => {
-        // Fetch drivers who are NOT allocated (current_cost_center_id is null)
-        // Or maybe we want to allow stealing from other services? usually yes.
-        // For now, let's just list ALL drivers for the allocation select.
+        // Fetch all drivers 
         const { data } = await supabase.from('profiles').select('*').eq('role', 'driver').order('full_name');
         setAvailableDrivers(data || []);
     };
@@ -272,48 +278,148 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
         }
     };
 
-    const addCostCenter = async (e) => {
-        e.preventDefault();
+    const toggleExpenseType = async (typeId, isEnabled) => {
         try {
-            const { data, error } = await supabase
-                .from('cost_centers')
-                .insert({
-                    service_id: service.id,
-                    organization_id: profile.organization_id, // Added required field
-                    name: newCostName,
-                    code: newCostCode
-                })
-                .select().single();
-            if (error) throw error;
-            setDetails(prev => ({ ...prev, costCenters: [...prev.costCenters, data] }));
-            setNewCostName(''); setNewCostCode('');
-            toast.success("Centro de Custo adicionado");
+            if (isEnabled) {
+                // Remove (Unlink)
+                const { error } = await supabase
+                    .from('service_expense_types')
+                    .delete()
+                    .eq('service_id', service.id)
+                    .eq('expense_type_id', typeId);
+                if (error) throw error;
+                setDetails(prev => ({ ...prev, expenseTypes: prev.expenseTypes.filter(id => id !== typeId) }));
+                toast.success("Tipo removido");
+            } else {
+                // Add (Link)
+                const { error } = await supabase
+                    .from('service_expense_types')
+                    .insert({ service_id: service.id, expense_type_id: typeId });
+                if (error) throw error;
+                setDetails(prev => ({ ...prev, expenseTypes: [...prev.expenseTypes, typeId] }));
+                toast.success("Tipo adicionado");
+            }
         } catch (e) {
-            console.error("CC Error:", e);
-            toast.error("Erro ao criar CC: " + (e.message || e.details));
+            console.error(e);
+            toast.error("Erro ao atualizar tipo de despesa");
         }
     };
 
     const allocateDriver = async (e) => {
         e.preventDefault();
-        if (!driverToAlloc || !targetCostCenter) return;
+        if (!driverToAlloc) {
+            toast.error("Selecione um colaborador.");
+            return;
+        }
+        if (!scheduledAt) {
+            toast.error("Informe a data e hora de início.");
+            return;
+        }
+
         try {
+            // Check if already allocated to avoid duplicates unique constraint error
+            const { data: existing } = await supabase
+                .from('profile_services')
+                .select('id')
+                .eq('service_id', service.id)
+                .eq('profile_id', driverToAlloc)
+                .maybeSingle();
+
+            if (existing) {
+                toast.info("Colaborador já está alocado neste serviço.");
+                return;
+            }
+
             const { error } = await supabase
-                .from('profiles')
-                .update({ current_cost_center_id: targetCostCenter })
-                .eq('id', driverToAlloc);
+                .from('profile_services')
+                .insert({
+                    service_id: service.id,
+                    profile_id: driverToAlloc,
+                    scheduled_at: scheduledAt
+                });
 
             if (error) throw error;
-            toast.success("Colaborador alocado com sucesso!");
+
+            // Trigger Supabase Edge Function (Secure Proxy to N8N)
+            try {
+                console.log("🚀 Iniciando envio de convite via Edge Function...");
+
+                const { error: fnError } = await supabase.functions.invoke('invite-user', {
+                    body: {
+                        profile_id: driverToAlloc,
+                        service_id: service.id,
+                        date_time: new Date(scheduledAt).toISOString()
+                    }
+                });
+
+                if (fnError) throw fnError;
+
+                toast.success("Convite enviado com sucesso!");
+            } catch (webhookErr) {
+                console.error("❌ Erro na Edge Function:", webhookErr);
+                toast.success("Colaborador alocado, mas erro no envio do convite.");
+            }
+
             fetchDetails(); // Refresh team list
             setDriverToAlloc('');
-        } catch (e) { toast.error("Erro ao alocar"); }
+            setScheduledAt('');
+        } catch (e) {
+            console.error(e);
+            toast.error("Erro ao alocar colaborador");
+        }
+    };
+
+    const handleQuickAdd = async (e) => {
+        e.preventDefault();
+        if (!quickName || !quickPhone) return;
+
+        setIsSavingQuick(true);
+        try {
+            // Basic phone validation/cleanup
+            const cleanPhone = quickPhone.replace(/\D/g, '');
+
+            // Create new profile (driver by default)
+            const { data, error } = await supabase
+                .from('profiles')
+                .insert({
+                    full_name: quickName,
+                    whatsapp_number: cleanPhone,
+                    role: 'driver', // Default role for new quick adds
+                    organization_id: profile.organization_id
+                })
+                .select()
+                .single();
+
+            if (error) throw error;
+
+            toast.success("Colaborador cadastrado!");
+
+            // Refresh drivers list and auto-select
+            await fetchAvailableDrivers();
+            setDriverToAlloc(data.id);
+
+            // Close modal
+            setShowQuickAdd(false);
+            setQuickName('');
+            setQuickPhone('');
+
+        } catch (err) {
+            console.error(err);
+            toast.error("Erro ao cadastrar: " + (err.message || "Verifique os dados"));
+        } finally {
+            setIsSavingQuick(false);
+        }
     };
 
     const deallocateDriver = async (driverId) => {
         if (!confirm("Remover alocação deste colaborador?")) return;
         try {
-            const { error } = await supabase.from('profiles').update({ current_cost_center_id: null }).eq('id', driverId);
+            const { error } = await supabase
+                .from('profile_services')
+                .delete()
+                .eq('service_id', service.id)
+                .eq('profile_id', driverId);
+
             if (error) throw error;
             toast.success("Desalocado.");
             fetchDetails();
@@ -349,14 +455,14 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                         Tarefas / OS ({details.tasks.length})
                     </button>
                     <button
-                        onClick={() => setActiveTab('costs')}
+                        onClick={() => setActiveTab('expenses')}
                         className={clsx(
                             "pb-3 text-sm font-medium flex items-center gap-2 transition-colors border-b-2",
-                            activeTab === 'costs' ? "border-indigo-600 text-indigo-600" : "border-transparent text-gray-500 hover:text-gray-700"
+                            activeTab === 'expenses' ? "border-indigo-600 text-indigo-600" : "border-transparent text-gray-500 hover:text-gray-700"
                         )}
                     >
                         <DollarSign size={18} />
-                        Centros de Custo ({details.costCenters.length})
+                        Tipos de Despesa
                     </button>
                     <button
                         onClick={() => setActiveTab('team')}
@@ -368,6 +474,18 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                         <Users size={18} />
                         Equipe Alocada ({details.team.length})
                     </button>
+                    {(profile?.role === 'admin' || profile?.role === 'manager') && (
+                        <button
+                            onClick={() => setActiveTab('settings')}
+                            className={clsx(
+                                "pb-3 text-sm font-medium flex items-center gap-2 transition-colors border-b-2",
+                                activeTab === 'settings' ? "border-indigo-600 text-indigo-600" : "border-transparent text-gray-500 hover:text-gray-700"
+                            )}
+                        >
+                            <Briefcase size={18} />
+                            Configurações
+                        </button>
+                    )}
                 </div>
             </div>
 
@@ -410,55 +528,56 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                     </div>
                 )}
 
-                {/* --- TAB: COSTS --- */}
-                {activeTab === 'costs' && (
+                {/* --- TAB: EXPENSES --- */}
+                {activeTab === 'expenses' && (
                     <div className="max-w-3xl space-y-6">
                         <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
                             <h3 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">
                                 <DollarSign size={20} className="text-gray-400" />
-                                Centros de Custo
+                                Tipos de Despesa Permitidos
                             </h3>
+                            <p className="text-sm text-gray-500 mb-6">
+                                Selecione quais categorias de despesa são aceitas neste serviço/obra.
+                            </p>
 
-                            <form onSubmit={addCostCenter} className="flex gap-2 mb-6 p-4 bg-gray-50 rounded-md border border-gray-100 items-end">
-                                <div className="flex-1">
-                                    <label className="block text-xs font-medium text-gray-500 mb-1">Nome (ex: Combustível)</label>
-                                    <input
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm outline-none"
-                                        placeholder="Nome..."
-                                        value={newCostName}
-                                        onChange={e => setNewCostName(e.target.value)}
-                                        required
-                                    />
-                                </div>
-                                <div className="w-32">
-                                    <label className="block text-xs font-medium text-gray-500 mb-1">Código (Opcional)</label>
-                                    <input
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm outline-none font-mono"
-                                        placeholder="COD-01"
-                                        value={newCostCode}
-                                        onChange={e => setNewCostCode(e.target.value)}
-                                    />
-                                </div>
-                                <button type="submit" className="bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-700 font-medium text-sm">Criar</button>
-                            </form>
-
-                            <table className="w-full text-sm text-left">
-                                <thead className="text-gray-500 bg-gray-50 border-b border-gray-100">
-                                    <tr>
-                                        <th className="px-4 py-2 font-medium">Código</th>
-                                        <th className="px-4 py-2 font-medium">Nome</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-gray-100">
-                                    {details.costCenters.map(cc => (
-                                        <tr key={cc.id}>
-                                            <td className="px-4 py-3 font-mono text-gray-500 text-xs">{cc.code || '-'}</td>
-                                            <td className="px-4 py-3 font-medium text-gray-800">{cc.name}</td>
-                                        </tr>
-                                    ))}
-                                    {details.costCenters.length === 0 && <tr><td colSpan="2" className="text-center py-4 text-gray-400">Nenhum centro de custo.</td></tr>}
-                                </tbody>
-                            </table>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {allExpenseTypes.map(type => {
+                                    const isEnabled = details.expenseTypes.includes(type.id);
+                                    return (
+                                        <div
+                                            key={type.id}
+                                            onClick={() => toggleExpenseType(type.id, isEnabled)}
+                                            className={clsx(
+                                                "p-4 rounded-lg border cursor-pointer transition-all flex items-center justify-between group",
+                                                isEnabled
+                                                    ? "bg-indigo-50 border-indigo-200 shadow-sm"
+                                                    : "bg-white border-gray-200 hover:border-indigo-300"
+                                            )}
+                                        >
+                                            <div className="flex items-center gap-3">
+                                                <div className={clsx(
+                                                    "w-8 h-8 rounded-full flex items-center justify-center",
+                                                    isEnabled ? "bg-indigo-100 text-indigo-600" : "bg-gray-100 text-gray-400"
+                                                )}>
+                                                    <DollarSign size={16} />
+                                                </div>
+                                                <span className={clsx("font-medium text-sm", isEnabled ? "text-indigo-900" : "text-gray-600")}>
+                                                    {type.name}
+                                                </span>
+                                            </div>
+                                            <div className={clsx(
+                                                "w-5 h-5 rounded border flex items-center justify-center transition-colors",
+                                                isEnabled ? "bg-indigo-600 border-indigo-600" : "bg-white border-gray-300"
+                                            )}>
+                                                {isEnabled && <CheckCircle size={12} className="text-white" />}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                                {allExpenseTypes.length === 0 && (
+                                    <p className="text-gray-400 col-span-2 text-center text-sm py-4">Nenhum tipo de despesa cadastrado no sistema global.</p>
+                                )}
+                            </div>
                         </div>
                     </div>
                 )}
@@ -469,40 +588,98 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                         {/* Allocation Form */}
                         <div className="bg-indigo-50 border border-indigo-100 p-6 rounded-lg flex items-end gap-4 shadow-sm">
                             <div className="flex-1">
-                                <label className="block text-xs font-bold text-indigo-800 mb-2 uppercase tracking-wide">Alocar Colaborador</label>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-xs font-bold text-indigo-800 uppercase tracking-wide">Alocar Colaborador</label>
+                                    <button
+                                        onClick={() => setShowQuickAdd(true)}
+                                        className="text-indigo-600 hover:text-indigo-800 text-xs font-bold flex items-center gap-1"
+                                    >
+                                        <Plus size={12} /> Novo
+                                    </button>
+                                </div>
                                 <select
-                                    className="w-full px-3 py-2 border border-indigo-200 rounded-md text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                    className="w-full px-3 py-2 border border-indigo-200 rounded-md text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
                                     value={driverToAlloc}
                                     onChange={e => setDriverToAlloc(e.target.value)}
                                 >
-                                    <option value="">Selecione um motorista...</option>
+                                    <option value="">Selecione um colaborador...</option>
                                     {availableDrivers.map(d => (
                                         <option key={d.id} value={d.id}>
-                                            {d.full_name} {d.current_cost_center_id ? '(Já alocado no contrato atual)' : '(Livre)'}
+                                            {d.full_name} {d.phone || d.whatsapp_number ? `(${d.phone || d.whatsapp_number})` : ''}
                                         </option>
                                     ))}
                                 </select>
                             </div>
-                            <div className="flex-1">
-                                <label className="block text-xs font-bold text-indigo-800 mb-2 uppercase tracking-wide">Para Centro de Custo</label>
-                                <select
-                                    className="w-full px-3 py-2 border border-indigo-200 rounded-md text-sm outline-none focus:ring-2 focus:ring-indigo-500"
-                                    value={targetCostCenter}
-                                    onChange={e => setTargetCostCenter(e.target.value)}
-                                >
-                                    <option value="">Selecione o destino...</option>
-                                    {details.costCenters.map(cc => (
-                                        <option key={cc.id} value={cc.id}>{cc.name} ({cc.code})</option>
-                                    ))}
-                                </select>
+
+                            <div className="w-48">
+                                <label className="block text-xs font-bold text-indigo-800 mb-2 uppercase tracking-wide">Início Previsto</label>
+                                <input
+                                    type="datetime-local"
+                                    className="w-full px-3 py-2 border border-indigo-200 rounded-md text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                                    value={scheduledAt}
+                                    onChange={e => setScheduledAt(e.target.value)}
+                                />
                             </div>
+
                             <button
                                 onClick={allocateDriver}
-                                className="bg-indigo-600 text-white px-6 py-2 rounded-md font-medium text-sm hover:bg-indigo-700 shadow-md transition-all"
+                                className="bg-indigo-600 text-white px-6 py-2 rounded-md font-medium text-sm hover:bg-indigo-700 shadow-md transition-all h-[38px] flex items-center gap-2"
                             >
-                                Confirmar Alocação
+                                <Send size={16} />
+                                Convidar Colaborador
                             </button>
                         </div>
+
+                        {/* Quick Add Modal */}
+                        {showQuickAdd && (
+                            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                                <div className="bg-white rounded-lg shadow-xl w-full max-w-sm p-6 relative animate-in fade-in zoom-in duration-200">
+                                    <h3 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">
+                                        <UserPlus size={20} className="text-indigo-600" />
+                                        Novo Colaborador
+                                    </h3>
+                                    <form onSubmit={handleQuickAdd} className="space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Nome Completo</label>
+                                            <input
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                                                placeholder="Ex: João da Silva"
+                                                value={quickName}
+                                                onChange={e => setQuickName(e.target.value)}
+                                                required
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">WhatsApp / Telefone</label>
+                                            <input
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                                                placeholder="Ex: 11999998888"
+                                                value={quickPhone}
+                                                onChange={e => setQuickPhone(e.target.value)}
+                                                required
+                                            />
+                                        </div>
+                                        <div className="flex gap-2 justify-end pt-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowQuickAdd(false)}
+                                                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-md"
+                                                disabled={isSavingQuick}
+                                            >
+                                                Cancelar
+                                            </button>
+                                            <button
+                                                type="submit"
+                                                className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-md hover:bg-indigo-700 disabled:opacity-50"
+                                                disabled={isSavingQuick}
+                                            >
+                                                {isSavingQuick ? 'Salvando...' : 'Salvar e Selecionar'}
+                                            </button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                        )}
 
                         {/* Allocated List */}
                         <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden">
@@ -513,7 +690,6 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                                 <thead className="text-gray-500 border-b border-gray-200 bg-white">
                                     <tr>
                                         <th className="px-6 py-3 font-medium">Colaborador</th>
-                                        <th className="px-6 py-3 font-medium">Centro de Custo (Função Hoje)</th>
                                         <th className="px-6 py-3 font-medium text-right">Ações</th>
                                     </tr>
                                 </thead>
@@ -525,15 +701,12 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                                                     {member.full_name?.charAt(0)}
                                                 </div>
                                                 <div>
-                                                    <div>{member.full_name}</div>
-                                                    <div className="text-xs text-gray-400 font-mono">{member.whatsapp_number}</div>
+                                                    <div className="flex items-center gap-2">
+                                                        <span>{member.full_name}</span>
+                                                        <StatusBadge status={member.invite_status} />
+                                                    </div>
+                                                    <div className="text-xs text-gray-400 font-mono">{member.whatsapp_number || member.phone}</div>
                                                 </div>
-                                            </td>
-                                            <td className="px-6 py-4">
-                                                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-100">
-                                                    <Truck size={12} />
-                                                    {member.cost_centers?.name} ({member.cost_centers?.code})
-                                                </span>
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <button
@@ -558,6 +731,98 @@ function ServiceDetailView({ service, activeTab, setActiveTab }) {
                         </div>
                     </div>
                 )}
+                {/* --- TAB: SETTINGS (Admin/Manager Only) --- */}
+                {activeTab === 'settings' && (
+                    <div className="max-w-3xl space-y-6">
+                        <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+                            <h3 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">
+                                <Briefcase size={20} className="text-gray-400" />
+                                Configurações do Serviço
+                            </h3>
+
+                            <ServiceSettingsForm service={service} />
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function ServiceSettingsForm({ service }) {
+    const { profile } = useAuth();
+    const [managers, setManagers] = useState([]);
+    const [selectedManager, setSelectedManager] = useState(service.manager_id || '');
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        fetchManagers();
+    }, []);
+
+    const fetchManagers = async () => {
+        const { data } = await supabase
+            .from('profiles')
+            .select('id, full_name, role')
+            .in('role', ['admin', 'manager'])
+            .eq('organization_id', profile.organization_id)
+            .order('full_name');
+        setManagers(data || []);
+    };
+
+    const handleUpdateManager = async () => {
+        setLoading(true);
+        try {
+            const val = selectedManager === '' ? null : selectedManager;
+            const { error } = await supabase
+                .from('services')
+                .update({ manager_id: val })
+                .eq('id', service.id);
+
+            if (error) throw error;
+            toast.success("Gestor atualizado com sucesso");
+        } catch (err) {
+            console.error(err);
+            toast.error("Erro ao atualizar gestor");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="space-y-4">
+            <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Gestor Responsável</label>
+                <p className="text-xs text-gray-500 mb-2">Este usuário terá acesso privilegiado a este serviço.</p>
+                <div className="flex gap-2">
+                    <select
+                        value={selectedManager}
+                        onChange={e => setSelectedManager(e.target.value)}
+                        className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                        <option value="">-- Sem Gestor Definido --</option>
+                        {managers.map(m => (
+                            <option key={m.id} value={m.id}>
+                                {m.full_name} ({m.role === 'admin' ? 'Admin' : 'Gerente'})
+                            </option>
+                        ))}
+                    </select>
+                    <button
+                        onClick={handleUpdateManager}
+                        disabled={loading}
+                        className="bg-indigo-600 text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                        {loading ? 'Salvando...' : 'Salvar'}
+                    </button>
+                </div>
+            </div>
+
+            <div className="pt-4 border-t border-gray-100">
+                <div className="bg-yellow-50 text-yellow-800 text-xs p-3 rounded-md border border-yellow-100 flex gap-2">
+                    <AlertCircle size={16} className="shrink-0" />
+                    <div>
+                        <strong>Atenção:</strong> Definir um Gestor limita a visualização deste serviço apenas a ele e aos administradores. Outros gerentes não verão este serviço.
+                    </div>
+                </div>
             </div>
         </div>
     );

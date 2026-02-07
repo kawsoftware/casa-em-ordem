@@ -9,12 +9,24 @@ export default function SignUp() {
     const [formData, setFormData] = useState({
         full_name: '',
         company_name: '',
+        cnpj: '',
+        employee_count: '',
         email: '',
         password: ''
     });
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
     const [success, setSuccess] = useState(false);
+
+    const maskCNPJ = (value) => {
+        return value
+            .replace(/\D/g, '')
+            .replace(/^(\d{2})(\d)/, '$1.$2')
+            .replace(/^(\d{2})\.(\d{3})(\d)/, '$1.$2.$3')
+            .replace(/\.(\d{3})(\d)/, '.$1/$2')
+            .replace(/(\d{4})(\d)/, '$1-$2')
+            .replace(/(-\d{2})\d+?$/, '$1');
+    };
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -26,7 +38,9 @@ export default function SignUp() {
         const { error } = await signUp(formData.email, formData.password, {
             data: {
                 full_name: formData.full_name,
-                company_name: formData.company_name
+                company_name: formData.company_name,
+                document: formData.cnpj,
+                size_range: formData.employee_count
             }
         });
 
@@ -107,6 +121,39 @@ export default function SignUp() {
                                         onChange={(e) => setFormData({ ...formData, company_name: e.target.value })}
                                         className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
                                     />
+                                </div>
+                            </div>
+
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">CNPJ</label>
+                                <div className="mt-1">
+                                    <input
+                                        type="text"
+                                        required
+                                        placeholder="00.000.000/0000-00"
+                                        value={formData.cnpj}
+                                        onChange={(e) => setFormData({ ...formData, cnpj: maskCNPJ(e.target.value) })}
+                                        className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                                    />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Funcionários</label>
+                                <div className="mt-1">
+                                    <select
+                                        required
+                                        value={formData.employee_count}
+                                        onChange={(e) => setFormData({ ...formData, employee_count: e.target.value })}
+                                        className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm bg-white"
+                                    >
+                                        <option value="" disabled>Selecione...</option>
+                                        <option value="0-20">0-20</option>
+                                        <option value="20-50">20-50</option>
+                                        <option value="Mais de 50">Mais de 50</option>
+                                    </select>
                                 </div>
                             </div>
                         </div>
